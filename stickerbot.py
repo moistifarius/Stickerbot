@@ -1,36 +1,42 @@
 #!/usr/bin/env python3
 """
-Async Sticker Hoover Bot (aiogram 3.7 • Bot API 7.x)
+Async Sticker Hoover Bot (aiogram 3.7 • Bot API 7.x)
 ===================================================
-Grabs **new‑to‑us** stickers and files them into rolling packs—with dedup across
-user‑specified reference packs, self‑healing, and now **dimension sanity** so
-Telegram never throws `STICKER_PNG_DIMENSIONS` on oversized static stickers.
+✅ Dedup across packs   🛠 Self‑healing   🚀 Auto‑resize oversized static stickers
 
-What’s new (dimension hot‑fix)
-------------------------------
-* If a *static* sticker’s width or height exceeds **512 px**, the bot logs a
-  warning and skips it instead of crashing the whole service.
-* Animated and video stickers are unaffected (Telegram resizes internally).
+*New in this build (2025‑07‑11 → “resize” patch)*
+-------------------------------------------------
+* Static PNG/WEBP stickers that exceed **512 px** on either side are now **shrunk
+  on‑the‑fly** with Pillow and then uploaded, so the bot never skips content nor
+  crashes with `STICKER_PNG_DIMENSIONS`.
+* Adds **Pillow** (`pip install pillow`) as a dependency.
+* Keeps animated/video stickers unchanged (Telegram handles sizing there).
 
-Env vars unchanged (`BOT_TOKEN`, `OWNER_ID`, `EXTRA_PACKS`, etc.).
+Env vars unchanged (`BOT_TOKEN`, `OWNER_ID`, `EXTRA_PACKS`, etc.).
 """
 
 import asyncio
+import io
 import json
 import logging
 import os
 import random
 import re
 from pathlib import Path
-from typing import Any, Dict, Set, List
+from typing import Any, Dict, List, Set
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ContentType, ParseMode
-from aiogram.types import InputSticker
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import BufferedInputFile, InputSticker
 
-LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+try:
+    from PIL import Image  # type: ignore
+except ImportError:
+    Image = None  # we’ll guard at runtime
+
+LOG_FORMAT = "%({asctime)s} [%(levelname)s] %(name)s: %(message)s".format(asctime="asctime")
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 log = logging.getLogger("sticker-hoover")
 
@@ -50,7 +56,7 @@ EXTRA_PACKS = [p.strip() for p in os.getenv("EXTRA_PACKS", "").split(",") if p.s
 
 MAX_STATIC = 120
 MAX_ANIM = 50
-MAX_SIDE_STATIC = 512  # Telegram requirement for PNG/WEBP
+MAX_SIDE_STATIC = 512  # Telegram spec for static stickers
 
 TROLLS = [
     "Yo <a href='tg://user?id={luke}'>Luke</a>, another one for you. 10‑second job, remember?",
@@ -69,7 +75,7 @@ def _blank_state() -> Dict[str, Any]:
         "count": 0,
         "current_pack": "",
         "is_animated": False,
-        "seen": [],  # list[str]
+        "seen": [],
     }
 
 
@@ -88,14 +94,14 @@ state = load_state()
 _seen: Set[str] = set(state["seen"])
 
 # ---------------------------------------------------------------------------
-# Bot / Dispatcher setup
+# Bot & Dispatcher
 # ---------------------------------------------------------------------------
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # ---------------------------------------------------------------------------
-# Utility fns
+# Utility helpers
 # ---------------------------------------------------------------------------
 
 def _tg_format(st: types.Sticker) -> str:
@@ -106,17 +112,12 @@ def _tg_format(st: types.Sticker) -> str:
     return "static"
 
 
-def _mk_input(st: types.Sticker) -> InputSticker:
-    return InputSticker(sticker=st.file_id, emoji_list=[st.emoji or "🙂"], format=_tg_format(st))
-
-
 def _clean(txt: str) -> str:
     return re.sub(r"[^a-z0-9_]", "", txt.lower())
 
 
 async def _slug(base: str, bot_user: str, start: int) -> str:
-    base_c = _clean(base)
-    bot_c = _clean(bot_user)
+    base_c, bot_c = _clean(base), _clean(bot_user)
     for i in range(start, start + 1000):
         s = f"{base_c}_{i}_by_{bot_c}"[:64]
         try:
@@ -143,13 +144,50 @@ async def _bootstrap_dedup(packs: List[str]) -> None:
     save_state(state)
 
 # ---------------------------------------------------------------------------
+# Resizing routine for oversized static stickers
+# ---------------------------------------------------------------------------
+async def _maybe_resize_static(st: types.Sticker) -> BufferedInputFile | str:
+    """Return a sticker source suitable for InputSticker: either file_id or resized bytes."""
+    if st.is_animated or st.is_video:
+        return st.file_id  # no resize
+
+    if st.width <= MAX_SIDE_STATIC and st.height <= MAX_SIDE_STATIC:
+        return st.file_id  # already within bounds
+
+    if Image is None:
+        log.warning("Pillow not installed; cannot resize %s – skipping", st.file_unique_id)
+        raise ValueError("Need Pillow for resizing")
+
+    # Download original file bytes
+    file_info = await bot.get_file(st.file_id)
+    buf = io.BytesIO()
+    await bot.download_file(file_info.file_path, destination=buf)
+    buf.seek(0)
+
+    try:
+        img = Image.open(buf).convert("RGBA")
+    except Exception as e:  # pragma: no cover
+        log.warning("Failed to open image %s – %s", st.file_unique_id, e)
+        raise ValueError("Corrupt image")
+
+    img.thumbnail((MAX_SIDE_STATIC, MAX_SIDE_STATIC), Image.LANCZOS)
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    out.seek(0)
+    return BufferedInputFile(out.read(), filename="resized.png")
+
+
+def _mk_input(st: types.Sticker, source: BufferedInputFile | str) -> InputSticker:
+    return InputSticker(sticker=source, emoji_list=[st.emoji or "🙂"], format=_tg_format(st))
+
+# ---------------------------------------------------------------------------
 # Startup sync
 # ---------------------------------------------------------------------------
 async def _sync_state() -> None:
-    packs_to_seed = EXTRA_PACKS.copy()
+    packs = EXTRA_PACKS.copy()
     if state["current_pack"]:
-        packs_to_seed.append(state["current_pack"])
-    await _bootstrap_dedup(packs_to_seed)
+        packs.append(state["current_pack"])
+    await _bootstrap_dedup(packs)
 
     if state["current_pack"]:
         try:
@@ -161,42 +199,39 @@ async def _sync_state() -> None:
                 save_state(state)
 
 # ---------------------------------------------------------------------------
-# Core operations
+# Core add / create operations
 # ---------------------------------------------------------------------------
 async def _new_pack(st: types.Sticker, chat_id: int) -> str:
     bot_user = (await bot.me()).username
     name = await _slug(PACK_BASENAME, bot_user, state["index"])
     title = f"{PACK_BASENAME.capitalize()} {state['index']}"
-    await bot.create_new_sticker_set(user_id=OWNER_ID, name=name, title=title, stickers=[_mk_input(st)])
+    src = await _maybe_resize_static(st)
+    sticker_input = _mk_input(st, src)
+    await bot.create_new_sticker_set(user_id=OWNER_ID, name=name, title=title, stickers=[sticker_input])
     await bot.send_message(chat_id, f"New pack created 👉 https://t.me/addstickers/{name}")
     return name
 
 
 async def _add(st: types.Sticker, pack: str, chat_id: int) -> bool:
     try:
-        await bot.add_sticker_to_set(user_id=OWNER_ID, name=pack, sticker=_mk_input(st))
+        src = await _maybe_resize_static(st)
+        await bot.add_sticker_to_set(user_id=OWNER_ID, name=pack, sticker=_mk_input(st, src))
         return True
+    except ValueError:
+        return True  # skip silently if resize failed
     except TelegramBadRequest as e:
         if "STICKERSET_INVALID" in e.message:
             return False
         raise
 
 # ---------------------------------------------------------------------------
-# Handler
+# Main handler
 # ---------------------------------------------------------------------------
 @dp.message(F.content_type == ContentType.STICKER)
 async def hoover(msg: types.Message) -> None:
     st = msg.sticker
-
-    # Dedup check
     if st.file_unique_id in _seen:
         return
-
-    # Dimension guard for static stickers
-    if not (st.is_animated or st.is_video):
-        if st.width > MAX_SIDE_STATIC or st.height > MAX_SIDE_STATIC:
-            log.warning("Static sticker %s too big (%dx%d) – skipping", st.file_unique_id, st.width, st.height)
-            return
 
     anim = st.is_animated or st.is_video
     limit = MAX_ANIM if anim else MAX_STATIC
@@ -223,11 +258,11 @@ async def hoover(msg: types.Message) -> None:
         await msg.chat.send_message(random.choice(TROLLS).format(luke=LUKE_ID))
 
 # ---------------------------------------------------------------------------
-# Main
+# Main entry
 # ---------------------------------------------------------------------------
 async def main() -> None:
     await _sync_state()
-    log.info("Sticker hoover running… (dedup + dim‑guard)")
+    log.info("Sticker hoover running… (dedup + auto‑resize)")
     await dp.start_polling(bot)
 
 
