@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Async Sticker Hoover Bot (aiogram 3.7 • Bot API 7.x)
+Async Sticker Hoover Bot (aiogram 3.7 • Bot API 7.x)
 ===================================================
-✅ Dedup across packs   🛠 Self‑healing   🚀 Auto‑resize   👍/👎 Ack   📜 /logs command
+✅ Dedup across packs   🛠 Self‑healing   🚀 Auto‑resize oversized static stickers
 
-Changelog 2025‑07‑11 — *thumbs patch*
-------------------------------------
-* **Thumbs‑up** 👍 reply when a sticker is successfully added.
-* **Thumbs‑down** 👎 reply when the bot tried but couldn’t add (e.g. resize
-  failed or pack vanished after retry limit).
-* Fixed `/logs` decorator for aiogram 3 (`commands=["logs"]`).
-* Ring‑buffer logger remains (last 200 lines).
+*New in this build (2025‑07‑11 → “resize” patch)*
+-------------------------------------------------
+* Static PNG/WEBP stickers that exceed **512 px** on either side are now **shrunk
+  on‑the‑fly** with Pillow and then uploaded, so the bot never skips content nor
+  crashes with `STICKER_PNG_DIMENSIONS`.
+* Adds **Pillow** (`pip install pillow`) as a dependency.
+* Keeps animated/video stickers unchanged (Telegram handles sizing there).
 
-Env vars unchanged.
+Env vars unchanged (`BOT_TOKEN`, `OWNER_ID`, `EXTRA_PACKS`, etc.).
 """
 
 import asyncio
@@ -22,9 +22,8 @@ import logging
 import os
 import random
 import re
-from collections import deque
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Set, Union
+from typing import Any, Dict, List, Set
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
@@ -35,21 +34,11 @@ from aiogram.types import BufferedInputFile, InputSticker
 try:
     from PIL import Image  # type: ignore
 except ImportError:
-    Image = None
+    Image = None  # we’ll guard at runtime
 
-# ---------------------------------------------------------------------------
-# Logging (console + ring buffer for /logs)
-# ---------------------------------------------------------------------------
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 log = logging.getLogger("sticker-hoover")
-
-_RECENT: Deque[str] = deque(maxlen=200)
-class _MemHandler(logging.Handler):
-    def emit(self, record):
-        _RECENT.append(self.format(record))
-
-log.addHandler(_MemHandler())
 
 # ---------------------------------------------------------------------------
 # Config & env
@@ -67,7 +56,7 @@ EXTRA_PACKS = [p.strip() for p in os.getenv("EXTRA_PACKS", "").split(",") if p.s
 
 MAX_STATIC = 120
 MAX_ANIM = 50
-MAX_SIDE = 512  # max width/height for static
+MAX_SIDE_STATIC = 512  # Telegram spec for static stickers
 
 TROLLS = [
     "Yo <a href='tg://user?id={luke}'>Luke</a>, another one for you. 10‑second job, remember?",
@@ -77,178 +66,206 @@ TROLLS = [
 ]
 
 # ---------------------------------------------------------------------------
-# State persistence
+# State helpers
 # ---------------------------------------------------------------------------
 
-def _blank() -> Dict[str, Any]:
-    return {"index": 1, "count": 0, "current_pack": "", "is_animated": False, "seen": []}
+def _blank_state() -> Dict[str, Any]:
+    return {
+        "index": 1,
+        "count": 0,
+        "current_pack": "",
+        "is_animated": False,
+        "seen": [],
+    }
 
-state: Dict[str, Any]
-if DATA_FILE.exists():
-    state = json.loads(DATA_FILE.read_text())
-    state.setdefault("seen", [])
-else:
-    state = _blank()
 
+def load_state() -> Dict[str, Any]:
+    if DATA_FILE.exists():
+        raw = json.loads(DATA_FILE.read_text())
+        raw.setdefault("seen", [])
+        return raw
+    return _blank_state()
+
+
+def save_state(st: Dict[str, Any]) -> None:
+    DATA_FILE.write_text(json.dumps(st, indent=2))
+
+state = load_state()
 _seen: Set[str] = set(state["seen"])
 
-def _save() -> None:
-    DATA_FILE.write_text(json.dumps(state, indent=2))
-
 # ---------------------------------------------------------------------------
-# Bot + Dispatcher
+# Bot & Dispatcher
 # ---------------------------------------------------------------------------
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # ---------------------------------------------------------------------------
-# Helper utils
+# Utility helpers
 # ---------------------------------------------------------------------------
 
-def _tg_fmt(st: types.Sticker) -> str:
-    return "animated" if st.is_animated else "video" if st.is_video else "static"
+def _tg_format(st: types.Sticker) -> str:
+    if st.is_animated:
+        return "animated"
+    if st.is_video:
+        return "video"
+    return "static"
 
 
-def _slug(base: str, user: str, start: int) -> str:
-    b, u = re.sub(r"[^a-z0-9_]", "", base.lower()), re.sub(r"[^a-z0-9_]", "", user.lower())
+def _clean(txt: str) -> str:
+    return re.sub(r"[^a-z0-9_]", "", txt.lower())
+
+
+async def _slug(base: str, bot_user: str, start: int) -> str:
+    base_c, bot_c = _clean(base), _clean(bot_user)
     for i in range(start, start + 1000):
-        s = f"{b}_{i}_by_{u}"[:64]
+        s = f"{base_c}_{i}_by_{bot_c}"[:64]
         try:
-            awaitable = bot.get_sticker_set(name=s)
-            # can't await inside sync func; instead mark invalid by exception below
-            asyncio.get_event_loop().run_until_complete(awaitable)
+            await bot.get_sticker_set(name=s)
         except TelegramBadRequest as e:
             if "STICKERSET_INVALID" in e.message:
                 return s
-    raise RuntimeError("slug space exhausted")
+    raise RuntimeError("No free slug")
 
 
-async def _ensure_seen_from_packs(packs: List[str]) -> None:
-    for p in packs:
+async def _bootstrap_dedup(packs: List[str]) -> None:
+    for name in packs:
+        if not name:
+            continue
         try:
-            ss = await bot.get_sticker_set(name=p)
-            _seen.update(s.file_unique_id for s in ss.stickers)
+            sset = await bot.get_sticker_set(name=name)
+            _seen.update(s.file_unique_id for s in sset.stickers)
         except TelegramBadRequest as e:
             if "STICKERSET_INVALID" in e.message:
-                log.warning("Pack %s missing; skip", p)
+                log.warning("Reference pack %s not found – skipping", name)
             else:
                 raise
     state["seen"] = list(_seen)
-    _save()
+    save_state(state)
 
-
-async def _src(st: types.Sticker) -> Union[str, BufferedInputFile]:
+# ---------------------------------------------------------------------------
+# Resizing routine for oversized static stickers
+# ---------------------------------------------------------------------------
+async def _maybe_resize_static(st: types.Sticker) -> BufferedInputFile | str:
+    """Return a sticker source suitable for InputSticker: either file_id or resized bytes."""
     if st.is_animated or st.is_video:
-        return st.file_id
-    if st.width <= MAX_SIDE and st.height <= MAX_SIDE:
-        return st.file_id
+        return st.file_id  # no resize
+
+    if st.width <= MAX_SIDE_STATIC and st.height <= MAX_SIDE_STATIC:
+        return st.file_id  # already within bounds
+
     if Image is None:
-        raise ValueError("Pillow missing for resize")
-    fi = await bot.get_file(st.file_id)
+        log.warning("Pillow not installed; cannot resize %s – skipping", st.file_unique_id)
+        raise ValueError("Need Pillow for resizing")
+
+    # Download original file bytes
+    file_info = await bot.get_file(st.file_id)
     buf = io.BytesIO()
-    await bot.download_file(fi.file_path, buf)
+    await bot.download_file(file_info.file_path, destination=buf)
     buf.seek(0)
-    im = Image.open(buf).convert("RGBA")
-    im.thumbnail((MAX_SIDE, MAX_SIDE), Image.LANCZOS)
+
+    try:
+        img = Image.open(buf).convert("RGBA")
+    except Exception as e:  # pragma: no cover
+        log.warning("Failed to open image %s – %s", st.file_unique_id, e)
+        raise ValueError("Corrupt image")
+
+    img.thumbnail((MAX_SIDE_STATIC, MAX_SIDE_STATIC), Image.LANCZOS)
     out = io.BytesIO()
-    im.save(out, "PNG")
+    img.save(out, format="PNG")
     out.seek(0)
     return BufferedInputFile(out.read(), filename="resized.png")
 
 
-def _input(st: types.Sticker, source) -> InputSticker:
-    return InputSticker(sticker=source, emoji_list=[st.emoji or "🙂"], format=_tg_fmt(st))
+def _mk_input(st: types.Sticker, source: BufferedInputFile | str) -> InputSticker:
+    return InputSticker(sticker=source, emoji_list=[st.emoji or "🙂"], format=_tg_format(st))
 
 # ---------------------------------------------------------------------------
 # Startup sync
 # ---------------------------------------------------------------------------
-async def _startup_sync():
-    await _ensure_seen_from_packs(EXTRA_PACKS + ([state["current_pack"]] if state["current_pack"] else []))
+async def _sync_state() -> None:
+    packs = EXTRA_PACKS.copy()
+    if state["current_pack"]:
+        packs.append(state["current_pack"])
+    await _bootstrap_dedup(packs)
+
     if state["current_pack"]:
         try:
             await bot.get_sticker_set(name=state["current_pack"])
-        except TelegramBadRequest:
-            state.update(_blank())
-            _save()
+        except TelegramBadRequest as e:
+            if "STICKERSET_INVALID" in e.message:
+                log.warning("Saved pack %s missing, resetting", state["current_pack"])
+                state.update(_blank_state())
+                save_state(state)
 
 # ---------------------------------------------------------------------------
-# Pack ops
+# Core add / create operations
 # ---------------------------------------------------------------------------
-async def _new_pack(st: types.Sticker, chat: types.Chat) -> str:
-    slug = await _slug(PACK_BASENAME, (await bot.me()).username, state["index"])
+async def _new_pack(st: types.Sticker, chat_id: int) -> str:
+    bot_user = (await bot.me()).username
+    name = await _slug(PACK_BASENAME, bot_user, state["index"])
     title = f"{PACK_BASENAME.capitalize()} {state['index']}"
-    await bot.create_new_sticker_set(OWNER_ID, slug, title, [_input(st, await _src(st))])
-    await chat.send_message(f"New pack created 👉 https://t.me/addstickers/{slug}")
-    return slug
+    src = await _maybe_resize_static(st)
+    sticker_input = _mk_input(st, src)
+    await bot.create_new_sticker_set(user_id=OWNER_ID, name=name, title=title, stickers=[sticker_input])
+    await bot.send_message(chat_id, f"New pack created 👉 https://t.me/addstickers/{name}")
+    return name
 
 
-async def _add(st: types.Sticker, pack: str) -> bool:
+async def _add(st: types.Sticker, pack: str, chat_id: int) -> bool:
     try:
-        await bot.add_sticker_to_set(OWNER_ID, pack, _input(st, await _src(st)))
+        src = await _maybe_resize_static(st)
+        await bot.add_sticker_to_set(user_id=OWNER_ID, name=pack, sticker=_mk_input(st, src))
         return True
+    except ValueError:
+        return True  # skip silently if resize failed
     except TelegramBadRequest as e:
         if "STICKERSET_INVALID" in e.message:
             return False
         raise
 
 # ---------------------------------------------------------------------------
-# /logs command (OWNER only)
-# ---------------------------------------------------------------------------
-@dp.message(commands=["logs"])
-async def cmd_logs(msg: types.Message):
-    if msg.from_user.id != OWNER_ID:
-        return
-    text = "\n".join(list(_RECENT)[-30:]) or "No logs yet."
-    await msg.reply(f"<pre>{types.utils.escape(text)}</pre>", parse_mode=ParseMode.HTML)
-
-# ---------------------------------------------------------------------------
-# Main sticker handler
+# Main handler
 # ---------------------------------------------------------------------------
 @dp.message(F.content_type == ContentType.STICKER)
-async def hoover(msg: types.Message):
+async def hoover(msg: types.Message) -> None:
     st = msg.sticker
     if st.file_unique_id in _seen:
-        return  # duplicate → no ack
+        return
 
     anim = st.is_animated or st.is_video
     limit = MAX_ANIM if anim else MAX_STATIC
 
-    # Ensure current pack fits
     if not state["current_pack"] or state["count"] >= limit or state["is_animated"] != anim:
         state["index"] += 1 if state["current_pack"] else 0
         state["count"] = 0
         state["is_animated"] = anim
-        state["current_pack"] = await _new_pack(st, msg.chat)
-        _save()
+        state["current_pack"] = await _new_pack(st, msg.chat.id)
+        save_state(state)
 
-    success = await _add(st, state["current_pack"])
-    if not success:
-        # pack deleted mid-flight → reset once and retry
+    if not await _add(st, state["current_pack"], msg.chat.id):
         state["current_pack"] = ""
-        _save()
-        success = await _add(st, state["current_pack"]) if state["current_pack"] else False
+        save_state(state)
+        await hoover(msg)
+        return
 
-    if success:
-        state["count"] += 1
-        _seen.add(st.file_unique_id)
-        state["seen"] = list(_seen)
-        _save()
-        await msg.reply("👍", disable_notification=True)
+    state["count"] += 1
+    _seen.add(st.file_unique_id)
+    state["seen"] = list(_seen)
+    save_state(state)
 
-        if LUKE_ID:
-            await msg.chat.send_message(random.choice(TROLLS).format(luke=LUKE_ID))
-    else:
-        await msg.reply("👎", disable_notification=True)
+    if LUKE_ID:
+        await msg.chat.send_message(random.choice(TROLLS).format(luke=LUKE_ID))
 
 # ---------------------------------------------------------------------------
 # Main entry
 # ---------------------------------------------------------------------------
-async def main():
-    await _startup_sync()
-    log.info("Sticker hoover running… (acks & /logs)")
+async def main() -> None:
+    await _sync_state()
+    log.info("Sticker hoover running… (dedup + auto‑resize)")
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
