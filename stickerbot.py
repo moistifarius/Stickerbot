@@ -1,30 +1,18 @@
 #!/usr/bin/env python3
 """
-Async Sticker Hoover Bot (aiogram 3.7 • Bot API 7.x)
+Async Sticker Hoover Bot (aiogram 3.7 • Bot API 7.x)
 ===================================================
-Grabs **new‑to‑us** stickers posted in chat and files them into a rolling series
-of packs. A sticker is considered *new* if its `file_unique_id` is **not**
-already present in **any** of the following:
+Grabs **new‑to‑us** stickers and files them into rolling packs—with dedup across
+user‑specified reference packs, self‑healing, and now **dimension sanity** so
+Telegram never throws `STICKER_PNG_DIMENSIONS` on oversized static stickers.
 
-* Packs that the bot has created so far (tracked automatically)
-* A configurable list of *reference packs* you tell it about via `EXTRA_PACKS`
-  env‑var (comma‑separated sticker‑set names)
+What’s new (dimension hot‑fix)
+------------------------------
+* If a *static* sticker’s width or height exceeds **512 px**, the bot logs a
+  warning and skips it instead of crashing the whole service.
+* Animated and video stickers are unaffected (Telegram resizes internally).
 
-This lets you seed the dedup list with existing packs so you never re‑import the
-same sticker twice.
-
-Env vars
---------
-| Variable         | Required | Purpose                                            |
-|------------------|----------|----------------------------------------------------|
-| `BOT_TOKEN`      | ✅       | From **@BotFather**                                |
-| `OWNER_ID`       | ✅       | Human owner of the sticker packs                   |
-| `EXTRA_PACKS`    | ❌       | `packname1,packname2,…` to preload dedup list      |
-| `LUKE_ID`        | ❌       | Luke’s user‑ID for roast‑pings                     |
-| `PACK_BASENAME`  | ❌       | Base slug, default `stickies`                      |
-| `DATA_FILE`      | ❌       | JSON state path, default `./pack_state.json`       |
-
-Other behaviour unchanged: self‑heals, name sanitisation, pack rollover, etc.
+Env vars unchanged (`BOT_TOKEN`, `OWNER_ID`, `EXTRA_PACKS`, etc.).
 """
 
 import asyncio
@@ -62,6 +50,7 @@ EXTRA_PACKS = [p.strip() for p in os.getenv("EXTRA_PACKS", "").split(",") if p.s
 
 MAX_STATIC = 120
 MAX_ANIM = 50
+MAX_SIDE_STATIC = 512  # Telegram requirement for PNG/WEBP
 
 TROLLS = [
     "Yo <a href='tg://user?id={luke}'>Luke</a>, another one for you. 10‑second job, remember?",
@@ -80,7 +69,7 @@ def _blank_state() -> Dict[str, Any]:
         "count": 0,
         "current_pack": "",
         "is_animated": False,
-        "seen": [],  # list[str] of file_unique_id
+        "seen": [],  # list[str]
     }
 
 
@@ -99,14 +88,14 @@ state = load_state()
 _seen: Set[str] = set(state["seen"])
 
 # ---------------------------------------------------------------------------
-# Bot & Dispatcher
+# Bot / Dispatcher setup
 # ---------------------------------------------------------------------------
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # ---------------------------------------------------------------------------
-# Utility
+# Utility fns
 # ---------------------------------------------------------------------------
 
 def _tg_format(st: types.Sticker) -> str:
@@ -138,15 +127,13 @@ async def _slug(base: str, bot_user: str, start: int) -> str:
     raise RuntimeError("No free slug")
 
 
-async def _bootstrap_dedup(initial_packs: List[str]) -> None:
-    """Fill _seen with file_unique_ids from given packs."""
-    for name in initial_packs:
+async def _bootstrap_dedup(packs: List[str]) -> None:
+    for name in packs:
         if not name:
             continue
         try:
             sset = await bot.get_sticker_set(name=name)
-            for s in sset.stickers:
-                _seen.add(s.file_unique_id)
+            _seen.update(s.file_unique_id for s in sset.stickers)
         except TelegramBadRequest as e:
             if "STICKERSET_INVALID" in e.message:
                 log.warning("Reference pack %s not found – skipping", name)
@@ -156,16 +143,14 @@ async def _bootstrap_dedup(initial_packs: List[str]) -> None:
     save_state(state)
 
 # ---------------------------------------------------------------------------
-# Startup consistency
+# Startup sync
 # ---------------------------------------------------------------------------
 async def _sync_state() -> None:
-    # load dedup from our own current pack + EXTRA_PACKS
     packs_to_seed = EXTRA_PACKS.copy()
     if state["current_pack"]:
         packs_to_seed.append(state["current_pack"])
     await _bootstrap_dedup(packs_to_seed)
 
-    # ensure current_pack still exists
     if state["current_pack"]:
         try:
             await bot.get_sticker_set(name=state["current_pack"])
@@ -202,8 +187,16 @@ async def _add(st: types.Sticker, pack: str, chat_id: int) -> bool:
 @dp.message(F.content_type == ContentType.STICKER)
 async def hoover(msg: types.Message) -> None:
     st = msg.sticker
+
+    # Dedup check
     if st.file_unique_id in _seen:
-        return  # duplicate anywhere → skip
+        return
+
+    # Dimension guard for static stickers
+    if not (st.is_animated or st.is_video):
+        if st.width > MAX_SIDE_STATIC or st.height > MAX_SIDE_STATIC:
+            log.warning("Static sticker %s too big (%dx%d) – skipping", st.file_unique_id, st.width, st.height)
+            return
 
     anim = st.is_animated or st.is_video
     limit = MAX_ANIM if anim else MAX_STATIC
@@ -218,7 +211,7 @@ async def hoover(msg: types.Message) -> None:
     if not await _add(st, state["current_pack"], msg.chat.id):
         state["current_pack"] = ""
         save_state(state)
-        await hoover(msg)  # retry once
+        await hoover(msg)
         return
 
     state["count"] += 1
@@ -234,7 +227,7 @@ async def hoover(msg: types.Message) -> None:
 # ---------------------------------------------------------------------------
 async def main() -> None:
     await _sync_state()
-    log.info("Sticker hoover running… (dedup across packs)")
+    log.info("Sticker hoover running… (dedup + dim‑guard)")
     await dp.start_polling(bot)
 
 
