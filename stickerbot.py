@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Async Sticker Hoover Bot (aiogram 3.7 • Bot API 7.x)
+Async Sticker Hoover Bot (aiogram 3.7 • Bot API 7.x)
 ===================================================
 ✅ Dedup across packs   🛠 Self‑healing   🚀 Auto‑resize oversized static stickers
 
@@ -36,7 +36,7 @@ try:
 except ImportError:
     Image = None  # we’ll guard at runtime
 
-LOG_FORMAT = "%({asctime)s} [%(levelname)s] %(name)s: %(message)s".format(asctime="asctime")
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 log = logging.getLogger("sticker-hoover")
 
@@ -268,3 +268,5 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
