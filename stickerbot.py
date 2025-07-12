@@ -86,6 +86,12 @@ MAX_STATIC = 120
 MAX_ANIM = 50
 MAX_SIDE_STATIC = 512  # Telegram spec for static stickers
 
+# Queue and rate limiting configuration
+CONCURRENT_LIMIT = 3  # Limit concurrent sticker processing
+MAX_QUEUE_SIZE = 50   # Prevent memory issues
+RATE_LIMIT_DELAY = 0.1  # Small delay between operations
+MAX_ERROR_RATE = 0.3  # Circuit breaker threshold
+
 TROLLS = [
     "Yo <a href='tg://user?id={luke}'>Luke</a>, another one for you. 10‑second job, remember?",
     "Adding stickers so Luke doesn't have to. Classic.",
@@ -127,6 +133,12 @@ _seen: Set[str] = set(state["seen"])
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+
+# Queue management for high-volume scenarios
+processing_semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
+processing_queue: asyncio.Queue = None  # Will be initialized in main()
+error_count = 0
+total_processed = 0
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -202,6 +214,13 @@ async def _maybe_resize_static(st: types.Sticker) -> BufferedInputFile | str:
                  st.file_unique_id, st.width, st.height)
         return st.file_id  # already within bounds
 
+    # Skip resize for extremely large images during high load
+    queue_size = processing_queue.qsize() if processing_queue else 0
+    if queue_size > MAX_QUEUE_SIZE * 0.8 and (st.width > 2048 or st.height > 2048):
+        log.warning("Queue busy (%d), skipping resize for very large sticker %s (%dx%d)", 
+                   queue_size, st.file_unique_id, st.width, st.height)
+        raise ValueError("Skipping large resize during high load")
+
     log.info("Sticker %s oversized (%dx%d), resizing to fit %dx%d", 
              st.file_unique_id, st.width, st.height, MAX_SIDE_STATIC, MAX_SIDE_STATIC)
 
@@ -215,7 +234,15 @@ async def _maybe_resize_static(st: types.Sticker) -> BufferedInputFile | str:
         buf = io.BytesIO()
         await bot.download_file(file_info.file_path, destination=buf)
         buf.seek(0)
-        log.debug("Downloaded sticker %s for resizing (%d bytes)", st.file_unique_id, len(buf.getvalue()))
+        original_bytes = len(buf.getvalue())
+        log.debug("Downloaded sticker %s for resizing (%d bytes)", st.file_unique_id, original_bytes)
+        
+        # Skip if file is too large (>10MB during high load)
+        if queue_size > MAX_QUEUE_SIZE * 0.5 and original_bytes > 10 * 1024 * 1024:
+            log.warning("Queue busy (%d), skipping large file %s (%d bytes)", 
+                       queue_size, st.file_unique_id, original_bytes)
+            raise ValueError("Skipping large file during high load")
+            
     except Exception as e:
         log.error("Failed to download sticker %s for resizing: %s", st.file_unique_id, e)
         raise ValueError("Download failed")
@@ -229,10 +256,11 @@ async def _maybe_resize_static(st: types.Sticker) -> BufferedInputFile | str:
         out = io.BytesIO()
         img.save(out, format="PNG")
         out.seek(0)
+        final_bytes = len(out.getvalue())
         
-        log.info("Resized sticker %s from %dx%d to %dx%d (%d bytes)", 
+        log.info("Resized sticker %s from %dx%d to %dx%d (%d → %d bytes)", 
                 st.file_unique_id, original_size[0], original_size[1], 
-                new_size[0], new_size[1], len(out.getvalue()))
+                new_size[0], new_size[1], original_bytes, final_bytes)
         
         return BufferedInputFile(out.read(), filename="resized.png")
     except Exception as e:
@@ -310,77 +338,188 @@ async def _add(st: types.Sticker, pack: str, chat_id: int) -> bool:
 # ---------------------------------------------------------------------------
 @dp.message(F.content_type == ContentType.STICKER)
 async def hoover(msg: types.Message) -> None:
-    st = msg.sticker
-    user_info = f"user {msg.from_user.id}" if msg.from_user else "unknown user"
-    
-    log.info("Processing sticker %s from %s in chat %s (type: %s, size: %dx%d)", 
-             st.file_unique_id, user_info, msg.chat.id, _tg_format(st), st.width, st.height)
-    
-    if st.file_unique_id in _seen:
-        log.info("Sticker %s already processed, skipping", st.file_unique_id)
-        return
-
-    anim = st.is_animated or st.is_video
-    limit = MAX_ANIM if anim else MAX_STATIC
-
-    # Check if we need a new pack
-    needs_new_pack = (
-        not state["current_pack"] or 
-        state["count"] >= limit or 
-        state["is_animated"] != anim
-    )
-
-    if needs_new_pack:
-        log.info("Need new pack: current='%s', count=%d/%d, anim_mismatch=%s", 
-                state["current_pack"], state["count"], limit, state["is_animated"] != anim)
-        
-        state["index"] += 1 if state["current_pack"] else 0
-        state["count"] = 0
-        state["is_animated"] = anim
-        
-        try:
-            state["current_pack"] = await _new_pack(st, msg.chat.id)
-            save_state(state)
-        except Exception as e:
-            log.error("Failed to create new pack: %s", e)
-            await _add_reaction(msg, "👎", "pack creation failed")
-            return
-
-    # Try to add sticker to current pack
+    """Queue sticker for processing to prevent overload."""
     try:
-        success = await _add(st, state["current_pack"], msg.chat.id)
-        if not success:
-            log.warning("Pack '%s' became invalid, resetting and retrying", state["current_pack"])
-            state["current_pack"] = ""
-            save_state(state)
-            await hoover(msg)  # Recursive retry
+        # Non-blocking queue add with immediate feedback
+        processing_queue.put_nowait(msg)
+        log.info("Queued sticker %s from user %s (queue size: %d)", 
+                msg.sticker.file_unique_id, 
+                msg.from_user.id if msg.from_user else "unknown",
+                processing_queue.qsize())
+    except asyncio.QueueFull:
+        log.warning("Processing queue full, dropping sticker %s", msg.sticker.file_unique_id)
+        await _add_reaction(msg, "👎", "queue full - try again later")
+
+async def process_sticker(msg: types.Message) -> None:
+    """Process a single sticker with concurrency control."""
+    global error_count, total_processed
+    
+    async with processing_semaphore:
+        st = msg.sticker
+        user_info = f"user {msg.from_user.id}" if msg.from_user else "unknown user"
+        
+        # Circuit breaker check
+        if total_processed > 0 and error_count / total_processed > MAX_ERROR_RATE:
+            log.warning("Error rate too high (%d/%d), temporarily pausing processing", 
+                       error_count, total_processed)
+            await asyncio.sleep(5)  # Brief pause
+        
+        log.info("Processing sticker %s from %s in chat %s (type: %s, size: %dx%d)", 
+                st.file_unique_id, user_info, msg.chat.id, _tg_format(st), st.width, st.height)
+        
+        if st.file_unique_id in _seen:
+            log.info("Sticker %s already processed, skipping", st.file_unique_id)
             return
 
-        # Success! Update state and add reaction
-        state["count"] += 1
-        _seen.add(st.file_unique_id)
-        state["seen"] = list(_seen)
-        save_state(state)
+        # Add rate limiting delay
+        await asyncio.sleep(RATE_LIMIT_DELAY)
+        total_processed += 1
 
-        await _add_reaction(msg, "👍", f"added to pack '{state['current_pack']}'")
-        log.info("Sticker %s successfully processed. Pack '%s' now has %d stickers", 
-                st.file_unique_id, state["current_pack"], state["count"])
+        anim = st.is_animated or st.is_video
+        limit = MAX_ANIM if anim else MAX_STATIC
 
-        if LUKE_ID:
-            await msg.chat.send_message(random.choice(TROLLS).format(luke=LUKE_ID))
+        # Check if we need a new pack
+        needs_new_pack = (
+            not state["current_pack"] or 
+            state["count"] >= limit or 
+            state["is_animated"] != anim
+        )
 
-    except Exception as e:
-        log.error("Failed to process sticker %s: %s", st.file_unique_id, e)
-        await _add_reaction(msg, "👎", f"processing failed: {str(e)[:50]}")
+        if needs_new_pack:
+            log.info("Need new pack: current='%s', count=%d/%d, anim_mismatch=%s", 
+                    state["current_pack"], state["count"], limit, state["is_animated"] != anim)
+            
+            state["index"] += 1 if state["current_pack"] else 0
+            state["count"] = 0
+            state["is_animated"] = anim
+            
+            try:
+                state["current_pack"] = await _new_pack(st, msg.chat.id)
+                save_state(state)
+            except Exception as e:
+                log.error("Failed to create new pack: %s", e)
+                await _add_reaction(msg, "👎", "pack creation failed")
+                error_count += 1
+                return
+
+        # Try to add sticker to current pack
+        try:
+            success = await _add(st, state["current_pack"], msg.chat.id)
+            if not success:
+                log.warning("Pack '%s' became invalid, resetting and retrying", state["current_pack"])
+                state["current_pack"] = ""
+                save_state(state)
+                # Re-queue for retry instead of recursive call
+                await processing_queue.put(msg)
+                return
+
+            # Success! Update state and add reaction
+            state["count"] += 1
+            _seen.add(st.file_unique_id)
+            state["seen"] = list(_seen)
+            save_state(state)
+
+            await _add_reaction(msg, "👍", f"added to pack '{state['current_pack']}'")
+            log.info("Sticker %s successfully processed. Pack '%s' now has %d stickers", 
+                    st.file_unique_id, state["current_pack"], state["count"])
+
+            if LUKE_ID:
+                await msg.chat.send_message(random.choice(TROLLS).format(luke=LUKE_ID))
+
+        except Exception as e:
+            log.error("Failed to process sticker %s: %s", st.file_unique_id, e)
+            await _add_reaction(msg, "👎", f"processing failed: {str(e)[:50]}")
+            error_count += 1
+
+async def sticker_processor():
+    """Background task to process queued stickers."""
+    log.info("Starting sticker processor task")
+    while True:
+        try:
+            msg = await processing_queue.get()
+            await process_sticker(msg)
+            processing_queue.task_done()
+        except Exception as e:
+            log.error("Error in sticker processor: %s", e)
+            await asyncio.sleep(1)  # Brief pause on error
+
+# Add status command for monitoring
+@dp.message(Command("status"))
+async def status_cmd(msg: types.Message) -> None:
+    """Show bot status and queue information."""
+    if msg.from_user.id != OWNER_ID:
+        return
+    
+    queue_size = processing_queue.qsize() if processing_queue else 0
+    error_rate = (error_count / total_processed * 100) if total_processed > 0 else 0
+    
+    status_text = f"""🤖 <b>Bot Status</b>
+    
+📊 <b>Processing Stats:</b>
+• Queue size: {queue_size}
+• Total processed: {total_processed}
+• Errors: {error_count} ({error_rate:.1f}%)
+• Current pack: {state.get('current_pack', 'None')}
+• Pack count: {state.get('count', 0)}
+
+💾 <b>Memory:</b>
+• Seen stickers: {len(_seen)}
+• Log entries: {len(memory_handler.logs)}
+
+⚙️ <b>Config:</b>
+• Concurrent limit: {CONCURRENT_LIMIT}
+• Max queue size: {MAX_QUEUE_SIZE}
+• Rate limit delay: {RATE_LIMIT_DELAY}s"""
+    
+    await msg.reply(status_text)
+
+# Add logs command as requested
+@dp.message(Command("logs"))
+async def logs_cmd(msg: types.Message) -> None:
+    """Show recent logs."""
+    if msg.from_user.id != OWNER_ID:
+        return
+    
+    if not memory_handler.logs:
+        await msg.reply("No logs available.")
+        return
+    
+    # Get last 20 log entries
+    recent_logs = list(memory_handler.logs)[-20:]
+    logs_text = "📋 <b>Recent Logs:</b>\n\n<pre>" + "\n".join(recent_logs) + "</pre>"
+    
+    # Split message if too long
+    if len(logs_text) > 4000:
+        logs_text = logs_text[:4000] + "...\n[truncated]</pre>"
+    
+    await msg.reply(logs_text)
 
 # ---------------------------------------------------------------------------
 # Main entry
 # ---------------------------------------------------------------------------
 async def main() -> None:
+    global processing_queue
+    
     log.info("Starting Sticker Hoover Bot...")
+    
+    # Initialize the processing queue
+    processing_queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
+    
     await _sync_state()
-    log.info("Sticker hoover running… (dedup + auto‑resize + reactions)")
-    await dp.start_polling(bot)
+    
+    # Start background processor
+    processor_task = asyncio.create_task(sticker_processor())
+    
+    log.info("Sticker hoover running… (dedup + auto‑resize + reactions + queue)")
+    
+    try:
+        await dp.start_polling(bot)
+    finally:
+        processor_task.cancel()
+        try:
+            await processor_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":
