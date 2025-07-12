@@ -26,6 +26,7 @@ import logging
 import os
 import random
 import re
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
@@ -33,6 +34,7 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ContentType, ParseMode
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, InputSticker
 
 try:
@@ -43,6 +45,28 @@ except ImportError:
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 log = logging.getLogger("sticker-hoover")
+
+# ---------------------------------------------------------------------------
+# In-memory log storage for /logs command
+# ---------------------------------------------------------------------------
+class MemoryLogHandler(logging.Handler):
+    """Custom handler to store logs in memory for the /logs command."""
+    
+    def __init__(self, maxlen=100):
+        super().__init__()
+        self.logs = deque(maxlen=maxlen)
+        self.setFormatter(logging.Formatter(LOG_FORMAT))
+    
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.logs.append(msg)
+        except Exception:
+            self.handleError(record)
+
+# Set up memory log handler
+memory_handler = MemoryLogHandler(maxlen=200)  # Keep last 200 log entries
+log.addHandler(memory_handler)
 
 # ---------------------------------------------------------------------------
 # Config & env
