@@ -79,3 +79,8 @@ def test_garbage_raises():
         media.to_static(b"not an image")
     with pytest.raises(media.ConversionError):
         asyncio.run(media.to_video(b"not a video", ".mp4"))
+
+
+def test_odd_size_video():
+    src = ff("-f", "lavfi", "-i", "testsrc2=size=500x333:rate=25:duration=2", "-c:v", "libx264", ".mp4")
+    check_video_sticker(asyncio.run(media.to_video(src, ".mp4")))

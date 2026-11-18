@@ -264,3 +264,44 @@ def test_emoji_from_caption():
     assert emoji_from_caption("🔥 lol") == "🔥"
     assert emoji_from_caption("lol") is None
     assert emoji_from_caption(None) is None
+
+
+def test_refresh_failure_after_add_does_not_add_twice(tmp_path):
+    from aiogram.exceptions import TelegramNetworkError
+    from aiogram.methods import GetMe
+    e = Env(tmp_path)
+
+    async def go():
+        await e.start()
+        await e.feed(e.sticker(1))
+        # add succeeds, then the follow-up get_sticker_set keeps failing
+        e.bot.fail_next["get_sticker_set"] = [TelegramNetworkError(GetMe(), "boom")] * 6
+        await e.feed(e.sticker(2))
+        await e.feed(e.sticker(2, message_id=3))  # re-sent: must be a dupe
+
+    run(go())
+    assert e.pack_sizes() == {"stickies_1_by_hooverbot": 2}
+    assert [r[2] for r in e.bot.reactions] == ["👍", "👍", "👌"]
+
+
+def test_stale_listing_does_not_record_wrong_sticker_for_undo(tmp_path):
+    e = Env(tmp_path)
+    real_get = e.bot.get_sticker_set
+
+    async def go():
+        await e.start()
+        await e.feed(e.sticker(1))
+        first = e.store.last_sticker()["pack_file_id"]
+
+        async def lagging(name):  # returns the set as it was before the add
+            s = await real_get(name)
+            s.stickers = s.stickers[:-1]
+            return s
+        e.bot.get_sticker_set = lagging
+        await e.feed(e.sticker(2))
+        return first
+
+    first = run(go())
+    last = e.store.last_sticker()
+    assert last["source_uid"] == "su2" and last["pack_file_id"] == ""
+    assert first != ""

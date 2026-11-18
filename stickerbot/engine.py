@@ -325,12 +325,23 @@ class Hoover:
         raise Permanent("could not find a pack with room")
 
     async def _refresh(self, placed: Placed) -> tuple[str, str]:
-        """Sync pack count from Telegram and return (file_id, file_unique_id) of the new sticker."""
-        sset = await self._get_set(placed.pack)
+        """Best-effort: sync pack count from Telegram and return (file_id, file_unique_id)
+        of the sticker just added, or ("", "") if it can't be identified with confidence.
+        Never raises: the add already succeeded and must not be retried."""
+        try:
+            sset = await self._get_set(placed.pack)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not refresh %s after add: %s", placed.pack, e)
+            self.store.set_pack_count(placed.pack, placed.count, self.cfg.pack_limit)
+            return "", ""
         if sset is None or not sset.stickers:
             return "", ""
         self.store.set_pack_count(placed.pack, len(sset.stickers), self.cfg.pack_limit)
         last = sset.stickers[-1]
+        # if the listing lags, the last entry is an older sticker we already recorded
+        if self.store.sticker_by_pack_uid(last.file_unique_id) or len(sset.stickers) < placed.count:
+            log.warning("Pack %s listing looks stale; not recording file id for undo", placed.pack)
+            return "", ""
         return last.file_id, last.file_unique_id
 
     # --------------------------------------------------------------- process
@@ -362,8 +373,9 @@ class Hoover:
             except TelegramForbiddenError as e:
                 raise Permanent(e.message) from e
 
+            self.store.mark_seen(uid)  # before anything else can fail: never add twice
             file_id, pack_uid = await self._refresh(placed)
-            self.store.mark_seen(uid, pack_uid)
+            self.store.mark_seen(pack_uid)
             self.store.record_sticker(uid, placed.pack, file_id, pack_uid)
             if placed.created:
                 await self._announce_pack(placed.pack, job)
@@ -464,8 +476,20 @@ class Hoover:
 
     async def worker(self) -> None:
         log.info("Worker started (%d jobs pending)", self.store.queue_size())
+        hb = asyncio.create_task(self._heartbeat_loop())
+        try:
+            await self._work_loop()
+        finally:
+            hb.cancel()
+
+    async def _heartbeat_loop(self) -> None:
+        # separate task so long flood waits / ffmpeg runs don't look like a hang
         while True:
             self.heartbeat()
+            await asyncio.sleep(20)
+
+    async def _work_loop(self) -> None:
+        while True:
             try:
                 did = await self.run_once()
             except Exception:  # noqa: BLE001 — never let the worker die
